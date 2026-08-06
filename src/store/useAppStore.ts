@@ -299,13 +299,6 @@ export const useAppStore = create<AppState>()(
           nutritionPhase
         );
 
-        // Clear any bloated prior storage before writing the slim profile
-        try {
-          localStorage.removeItem("blueprint-app");
-        } catch {
-          /* ignore */
-        }
-
         set({
           profile,
           agenda: {
@@ -321,16 +314,13 @@ export const useAppStore = create<AppState>()(
             priorityParts: session.focusParts,
             priorityReason: session.focusReason,
           },
-          // Reset draft; photos cleared so they never re-enter persist
-          onboarding: { ...initialOnboarding, step: 0 },
+          // Keep name in draft for display; step reset is fine after complete
+          onboarding: {
+            ...initialOnboarding,
+            step: 0,
+            name: profile.name,
+          },
           hasHydrated: true,
-        });
-
-        // Persist under logged-in account (if any)
-        queueMicrotask(() => {
-          void import("@/store/useAuthStore").then(({ syncBlueprintToAccount }) => {
-            syncBlueprintToAccount();
-          });
         });
       },
 

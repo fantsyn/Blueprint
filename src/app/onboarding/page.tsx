@@ -87,18 +87,26 @@ export default function OnboardingPage() {
   const next = () => setOnboardingStep(Math.min(step + 1, STEPS.length - 1));
   const back = () => setOnboardingStep(Math.max(step - 1, 0));
 
-  const handleGenerate = async () => {
+const handleGenerate = async () => {
     setGenerating(true);
     try {
-      await new Promise((r) => setTimeout(r, 900));
+      await new Promise((r) => setTimeout(r, 600));
       completeOnboarding();
-      useAuthStore.getState().persistUserBlueprint();
-      router.replace("/today");
+      // Wait for cloud/local save so /today doesn't reload empty data
+      await useAuthStore.getState().persistUserBlueprint();
+      const p = useAppStore.getState().profile;
+      if (p?.onboardingComplete) {
+        router.replace("/today");
+      }
     } catch (err) {
       console.error("[onboarding] generate failed", err);
       const p = useAppStore.getState().profile;
       if (p?.onboardingComplete) {
-        useAuthStore.getState().persistUserBlueprint();
+        try {
+          await useAuthStore.getState().persistUserBlueprint();
+        } catch {
+          /* still try to enter app */
+        }
         router.replace("/today");
       }
     } finally {

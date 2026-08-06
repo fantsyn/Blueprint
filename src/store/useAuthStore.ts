@@ -22,6 +22,7 @@ import {
   loadCloudBlueprint,
   saveCloudBlueprint,
   updateProfileName,
+  type CloudBlueprintData,
 } from "@/lib/supabase/sync";
 import { useAppStore } from "@/store/useAppStore";
 import { useJournalStore } from "@/store/useJournalStore";
@@ -31,7 +32,6 @@ interface AuthState {
   session: AuthSession | null;
   hasHydrated: boolean;
   error: string | null;
-  /** true when NEXT_PUBLIC_SUPABASE_* are set */
   cloudEnabled: boolean;
 
   hydrate: () => Promise<void>;
@@ -41,15 +41,21 @@ interface AuthState {
     email: string;
     password: string;
     remember: boolean;
-  }) => Promise<{ ok: true; needsEmailConfirm?: boolean } | { ok: false; error: string }>;
+  }) => Promise<
+    { ok: true; needsEmailConfirm?: boolean } | { ok: false; error: string }
+  >;
   login: (opts: {
     email: string;
     password: string;
     remember: boolean;
   }) => Promise<{ ok: true } | { ok: false; error: string }>;
   logout: () => Promise<void>;
-  persistUserBlueprint: () => void;
+  persistUserBlueprint: () => Promise<void>;
 }
+
+/** Only run full hydrate once per page lifetime */
+let hydratePromise: Promise<void> | null = null;
+let authListenerBound = false;
 
 function applyLoadedData(
   data: {
@@ -58,15 +64,30 @@ function applyLoadedData(
     nutritionPhase: ReturnType<typeof useAppStore.getState>["nutritionPhase"];
     journal?: ReturnType<typeof useJournalStore.getState>["journal"];
   },
-  accountName?: string
+  accountName?: string,
+  opts?: { preserveOnboardingDraft?: boolean }
 ) {
+  const current = useAppStore.getState();
+
+  // Never clobber a finished blueprint with empty cloud/local
+  if (
+    !data.profile?.onboardingComplete &&
+    current.profile?.onboardingComplete
+  ) {
+    if (data.journal) {
+      useJournalStore.getState().setJournal(data.journal);
+    }
+    return;
+  }
+
   if (data.journal) {
     useJournalStore.getState().setJournal(data.journal);
-  } else {
+  } else if (!current.profile?.onboardingComplete) {
+    // Only reset journal when starting fresh
     useJournalStore.getState().resetJournal();
   }
 
-  if (data.profile) {
+  if (data.profile?.onboardingComplete) {
     useAppStore.setState({
       profile: data.profile,
       agenda: data.agenda,
@@ -82,31 +103,47 @@ function applyLoadedData(
       selectedBodyPart: null,
       hasHydrated: true,
     });
-  } else {
-    useAppStore.setState({
-      profile: null,
-      agenda: null,
-      selectedBodyPart: null,
-      nutritionPhase: "maintain",
-      onboarding: {
-        step: 0,
-        name: accountName || "",
-        metrics: {
-          age: 28,
-          sex: "male",
-          heightCm: 175,
-          weightKg: 75,
-          experience: "intermediate",
-          equipment: "full_gym",
-          injuries: [],
-        },
-        photos: {},
-        goal: { type: "recomposition", inspoImages: [] },
-        inspoUrls: [],
-      },
-      hasHydrated: true,
-    });
+    return;
   }
+
+  // Empty / incomplete cloud — keep in-progress onboarding draft
+  const keepDraft =
+    opts?.preserveOnboardingDraft !== false &&
+    (current.onboarding.step > 0 ||
+      Boolean(current.onboarding.name) ||
+      Boolean(current.onboarding.metrics.weightKg));
+
+  useAppStore.setState({
+    profile: data.profile ?? null,
+    agenda: data.agenda ?? null,
+    selectedBodyPart: null,
+    nutritionPhase: data.nutritionPhase || current.nutritionPhase || "maintain",
+    onboarding: keepDraft
+      ? {
+          ...current.onboarding,
+          name:
+            current.onboarding.name ||
+            accountName ||
+            current.onboarding.name,
+        }
+      : {
+          step: 0,
+          name: accountName || "",
+          metrics: {
+            age: 28,
+            sex: "male",
+            heightCm: 175,
+            weightKg: 75,
+            experience: "intermediate",
+            equipment: "full_gym",
+            injuries: [],
+          },
+          photos: {},
+          goal: { type: "recomposition", inspoImages: [] },
+          inspoUrls: [],
+        },
+    hasHydrated: true,
+  });
 }
 
 function applyLocalUserData(userId: string, accountName?: string) {
@@ -123,10 +160,45 @@ function applyLocalUserData(userId: string, accountName?: string) {
 }
 
 async function applyCloudUserData(userId: string, accountName?: string) {
+  // Prefer local cache if it has a completed blueprint (fast path + offline)
+  const local = loadUserData(userId);
+  if (local?.profile?.onboardingComplete) {
+    applyLoadedData(
+      {
+        profile: local.profile,
+        agenda: local.agenda,
+        nutritionPhase: local.nutritionPhase || "maintain",
+        journal: local.journal,
+      },
+      accountName
+    );
+  }
+
   const data = await loadCloudBlueprint(userId);
+
+  // Cloud has completed blueprint — use it
+  if (data?.profile?.onboardingComplete) {
+    applyLoadedData(data, accountName || data.profile.name);
+    // Refresh local cache
+    saveUserData(userId, data);
+    return;
+  }
+
+  // Cloud empty but local completed — keep local and re-push
+  if (local?.profile?.onboardingComplete) {
+    void saveCloudBlueprint(userId, {
+      profile: local.profile,
+      agenda: local.agenda,
+      nutritionPhase: local.nutritionPhase || "maintain",
+      journal: local.journal || emptyJournal(),
+    });
+    return;
+  }
+
+  // Both incomplete — load cloud if any, but preserve draft
   if (data) {
-    applyLoadedData(data, accountName || data.profile?.name);
-  } else {
+    applyLoadedData(data, accountName, { preserveOnboardingDraft: true });
+  } else if (!local?.profile) {
     applyLoadedData(
       {
         profile: null,
@@ -134,32 +206,26 @@ async function applyCloudUserData(userId: string, accountName?: string) {
         nutritionPhase: "maintain",
         journal: emptyJournal(),
       },
-      accountName
+      accountName,
+      { preserveOnboardingDraft: true }
     );
   }
 }
 
-function snapshotBlueprint() {
+function snapshotBlueprint(): CloudBlueprintData {
   const { profile, agenda, nutritionPhase } = useAppStore.getState();
   const journal = useJournalStore.getState().journal;
   return { profile, agenda, nutritionPhase, journal };
 }
 
-function persistLocal(userId: string) {
-  saveUserData(userId, snapshotBlueprint());
-}
-
-async function persistCloud(userId: string) {
-  await saveCloudBlueprint(userId, snapshotBlueprint());
-}
-
-function persistCurrentBlueprint(userId: string, cloud: boolean) {
+async function persistCurrentBlueprint(userId: string, cloud: boolean) {
+  const snap = snapshotBlueprint();
+  saveUserData(userId, snap);
   if (cloud) {
-    void persistCloud(userId);
-    // Also keep a local cache for offline feel
-    persistLocal(userId);
-  } else {
-    persistLocal(userId);
+    const result = await saveCloudBlueprint(userId, snap);
+    if (!result.ok) {
+      console.warn("[auth] cloud save failed", result.error);
+    }
   }
 }
 
@@ -170,88 +236,119 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   cloudEnabled: false,
 
   hydrate: async () => {
-    const cloud = isSupabaseConfigured();
-    set({ cloudEnabled: cloud });
+    if (hydratePromise) return hydratePromise;
 
-    if (cloud) {
-      const sb = getSupabaseBrowser();
-      if (!sb) {
-        set({ hasHydrated: true, session: null });
+    hydratePromise = (async () => {
+      const cloud = isSupabaseConfigured();
+      set({ cloudEnabled: cloud });
+
+      if (cloud) {
+        const sb = getSupabaseBrowser();
+        if (!sb) {
+          set({ hasHydrated: true, session: null });
+          return;
+        }
+
+        try {
+          const { data } = await sb.auth.getSession();
+          const s = data.session;
+          if (s?.user) {
+            const name =
+              (s.user.user_metadata?.name as string) ||
+              s.user.email?.split("@")[0] ||
+              "Athlete";
+            const session: AuthSession = {
+              userId: s.user.id,
+              email: s.user.email || "",
+              name,
+              remember: true,
+              expiresAt: null,
+            };
+            set({
+              session,
+              hasHydrated: true,
+              error: null,
+              cloudEnabled: true,
+            });
+            await applyCloudUserData(s.user.id, name);
+          } else {
+            set({ session: null, hasHydrated: true, cloudEnabled: true });
+            if (useAppStore.persist.hasHydrated()) {
+              useAppStore.getState().setHasHydrated(true);
+            }
+          }
+
+          if (!authListenerBound) {
+            authListenerBound = true;
+            sb.auth.onAuthStateChange(async (event, next) => {
+              // Do not re-load blueprint on TOKEN_REFRESHED / INITIAL_SESSION
+              // — that was wiping mid-onboarding progress.
+              if (event === "SIGNED_OUT") {
+                set({ session: null });
+                return;
+              }
+              if (event === "SIGNED_IN" && next?.user) {
+                const name =
+                  (next.user.user_metadata?.name as string) ||
+                  next.user.email?.split("@")[0] ||
+                  "Athlete";
+                const prev = get().session;
+                // Only full load when user id changes (real new sign-in)
+                if (!prev || prev.userId !== next.user.id) {
+                  set({
+                    session: {
+                      userId: next.user.id,
+                      email: next.user.email || "",
+                      name,
+                      remember: true,
+                      expiresAt: null,
+                    },
+                  });
+                  await applyCloudUserData(next.user.id, name);
+                } else {
+                  set({
+                    session: {
+                      ...prev,
+                      email: next.user.email || prev.email,
+                      name,
+                    },
+                  });
+                }
+              }
+            });
+          }
+        } catch (e) {
+          console.warn("[auth] cloud hydrate failed", e);
+          set({ hasHydrated: true, session: null, cloudEnabled: true });
+        }
         return;
       }
 
-      try {
-        const { data } = await sb.auth.getSession();
-        const s = data.session;
-        if (s?.user) {
-          const name =
-            (s.user.user_metadata?.name as string) ||
-            s.user.email?.split("@")[0] ||
-            "Athlete";
-          const session: AuthSession = {
-            userId: s.user.id,
-            email: s.user.email || "",
-            name,
-            remember: true,
-            expiresAt: null,
-          };
-          set({ session, hasHydrated: true, error: null, cloudEnabled: true });
-          await applyCloudUserData(s.user.id, name);
-        } else {
-          set({ session: null, hasHydrated: true, cloudEnabled: true });
-          if (useAppStore.persist.hasHydrated()) {
-            useAppStore.getState().setHasHydrated(true);
-          }
-        }
-
-        // Keep session in sync (token refresh / multi-tab)
-        sb.auth.onAuthStateChange(async (event, next) => {
-          if (event === "SIGNED_OUT" || !next?.user) {
-            if (get().session) {
-              set({ session: null });
-            }
-            return;
-          }
-          if (next.user && event === "SIGNED_IN") {
-            const name =
-              (next.user.user_metadata?.name as string) ||
-              next.user.email?.split("@")[0] ||
-              "Athlete";
-            set({
-              session: {
-                userId: next.user.id,
-                email: next.user.email || "",
-                name,
-                remember: true,
-                expiresAt: null,
-              },
-            });
-          }
+      // ── Local-only fallback ──
+      const session = readSession();
+      if (session) {
+        const accounts = loadAccounts();
+        const account = accounts.find((a) => a.id === session.userId);
+        const next = account
+          ? { ...session, name: account.name, email: account.email }
+          : session;
+        if (account) writeSession({ ...next, remember: session.remember });
+        set({
+          session: next,
+          hasHydrated: true,
+          error: null,
+          cloudEnabled: false,
         });
-      } catch (e) {
-        console.warn("[auth] cloud hydrate failed", e);
-        set({ hasHydrated: true, session: null, cloudEnabled: true });
+        applyLocalUserData(next.userId, next.name);
+      } else {
+        set({ session: null, hasHydrated: true, cloudEnabled: false });
+        if (useAppStore.persist.hasHydrated()) {
+          useAppStore.getState().setHasHydrated(true);
+        }
       }
-      return;
-    }
+    })();
 
-    // ── Local-only fallback ──
-    const session = readSession();
-    if (session) {
-      const accounts = loadAccounts();
-      const account = accounts.find((a) => a.id === session.userId);
-      const next = account
-        ? { ...session, name: account.name, email: account.email }
-        : session;
-      if (account) writeSession({ ...next, remember: session.remember });
-      set({ session: next, hasHydrated: true, error: null, cloudEnabled: false });
-      applyLocalUserData(next.userId, next.name);
-    } else {
-      set({ session: null, hasHydrated: true, cloudEnabled: false });
-      if (useAppStore.persist.hasHydrated()) {
-        useAppStore.getState().setHasHydrated(true);
-      }
-    }
+    return hydratePromise;
   },
 
   clearError: () => set({ error: null }),
@@ -267,7 +364,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
     const displayName = name.trim() || normalized.split("@")[0];
 
-    // ── Cloud (Supabase) ──
     if (isSupabaseConfigured()) {
       const sb = getSupabaseBrowser();
       if (!sb) return { ok: false, error: "Supabase client unavailable." };
@@ -288,12 +384,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         return { ok: false, error: error.message };
       }
 
-      // Email confirmation required → no session yet
       if (!data.session) {
-        return {
-          ok: true,
-          needsEmailConfirm: true,
-        };
+        return { ok: true, needsEmailConfirm: true };
       }
 
       const user = data.user;
@@ -311,13 +403,34 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         expiresAt: null,
       };
       set({ session, error: null, hasHydrated: true, cloudEnabled: true });
-      await applyCloudUserData(user.id, displayName);
-      useAppStore.getState().updateOnboarding({ name: displayName });
+
+      // Fresh account — do not wipe if we somehow have draft; start clean
+      useAppStore.setState({
+        profile: null,
+        agenda: null,
+        hasHydrated: true,
+        onboarding: {
+          step: 0,
+          name: displayName,
+          metrics: {
+            age: 28,
+            sex: "male",
+            heightCm: 175,
+            weightKg: 75,
+            experience: "intermediate",
+            equipment: "full_gym",
+            injuries: [],
+          },
+          photos: {},
+          goal: { type: "recomposition", inspoImages: [] },
+          inspoUrls: [],
+        },
+      });
+      useJournalStore.getState().resetJournal();
       void remember;
       return { ok: true };
     }
 
-    // ── Local fallback ──
     if (findAccountByEmail(normalized)) {
       return { ok: false, error: "An account with this email already exists." };
     }
@@ -362,7 +475,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   login: async ({ email, password, remember }) => {
     const normalized = email.trim().toLowerCase();
 
-    // ── Cloud ──
     if (isSupabaseConfigured()) {
       const sb = getSupabaseBrowser();
       if (!sb) return { ok: false, error: "Supabase client unavailable." };
@@ -374,10 +486,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
       if (error) {
         const msg = error.message.toLowerCase();
-        if (msg.includes("invalid login") || msg.includes("invalid credentials")) {
+        if (
+          msg.includes("invalid login") ||
+          msg.includes("invalid credentials")
+        ) {
           return {
             ok: false,
-            error: "Invalid email or password. Create an account first if you haven’t.",
+            error:
+              "Invalid email or password. Create an account first if you haven’t.",
           };
         }
         if (msg.includes("email not confirmed")) {
@@ -411,7 +527,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       return { ok: true };
     }
 
-    // ── Local ──
     const account = findAccountByEmail(normalized);
     if (!account) {
       return {
@@ -447,7 +562,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   logout: async () => {
     const { session, cloudEnabled } = get();
     if (session) {
-      persistCurrentBlueprint(session.userId, cloudEnabled);
+      await persistCurrentBlueprint(session.userId, cloudEnabled);
     }
     if (cloudEnabled) {
       const sb = getSupabaseBrowser();
@@ -459,13 +574,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ session: null, error: null });
   },
 
-  persistUserBlueprint: () => {
+  persistUserBlueprint: async () => {
     const { session, cloudEnabled } = get();
     if (!session) return;
-    persistCurrentBlueprint(session.userId, cloudEnabled);
+    await persistCurrentBlueprint(session.userId, cloudEnabled);
   },
 }));
 
 export function syncBlueprintToAccount() {
-  useAuthStore.getState().persistUserBlueprint();
+  void useAuthStore.getState().persistUserBlueprint();
+}
+
+export async function syncBlueprintToAccountAsync() {
+  await useAuthStore.getState().persistUserBlueprint();
 }

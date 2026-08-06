@@ -63,8 +63,18 @@ export async function loadCloudBlueprint(
   if (!data?.data || typeof data.data !== "object") return null;
 
   const raw = data.data as Partial<CloudBlueprintData>;
+  // Treat empty {} trigger-created rows as "no data yet"
+  const hasProfile = Boolean(
+    raw.profile &&
+      typeof raw.profile === "object" &&
+      (raw.profile as UserProfile).onboardingComplete
+  );
+  if (!hasProfile && !raw.agenda && !raw.journal) {
+    return null;
+  }
+
   return {
-    profile: raw.profile ?? null,
+    profile: (raw.profile as UserProfile) ?? null,
     agenda: raw.agenda ?? null,
     nutritionPhase: raw.nutritionPhase || "maintain",
     journal: raw.journal || emptyJournal(),

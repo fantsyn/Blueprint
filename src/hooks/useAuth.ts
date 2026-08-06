@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/store/useAuthStore";
 import { useAppStore } from "@/store/useAppStore";
 
-/** Hydrate auth session once on app surfaces */
+/** Hydrate auth session once on app surfaces (deduped inside store) */
 export function useAuthHydration() {
   const hydrate = useAuthStore((s) => s.hydrate);
   const hasHydrated = useAuthStore((s) => s.hasHydrated);
