@@ -11,7 +11,7 @@ export function useAuthHydration() {
   const hasHydrated = useAuthStore((s) => s.hasHydrated);
 
   useEffect(() => {
-    hydrate();
+    void hydrate();
   }, [hydrate]);
 
   return hasHydrated;
@@ -47,7 +47,6 @@ export function useRequireAuth(opts?: { allowGuestDemo?: boolean }) {
     if (!authHydrated) return;
 
     if (!session) {
-      // Guest demo path
       if (allowGuestDemo && profile?.onboardingComplete) return;
       router.replace("/login");
       return;

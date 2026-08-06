@@ -1,144 +1,73 @@
--- Blueprint · Supabase schema
--- Run in the Supabase SQL editor after creating a project.
+-- Blueprint · Supabase setup
+-- Run this entire file in: Supabase Dashboard → SQL Editor → New query → Run
 
--- Profiles
+-- 1) Profile metadata (optional, name display)
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   name text not null default '',
-  age int,
-  sex text check (sex in ('male', 'female', 'other')),
-  height_cm numeric,
-  weight_kg numeric,
-  body_fat_pct numeric,
-  experience text check (experience in ('beginner', 'intermediate', 'advanced')),
-  equipment text check (equipment in ('full_gym', 'home_dumbbells', 'bodyweight', 'minimal')),
-  injuries text[] default '{}',
-  goal_type text,
-  goal_description text,
-  target_weight_kg numeric,
-  onboarding_complete boolean default false,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
 
--- Physique photo captures (storage paths)
-create table if not exists public.physique_photos (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  pose text not null check (pose in ('front', 'side', 'back')),
-  storage_path text not null,
-  captured_at timestamptz default now()
+-- 2) Full app state as JSON (profile, agenda, journal, nutrition)
+--    Simple, reliable cross-device sync for the MVP.
+create table if not exists public.user_blueprints (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now()
 );
 
--- Body-part scores from vision + heuristics
-create table if not exists public.body_part_scores (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  capture_id uuid references public.physique_photos(id) on delete set null,
-  part_id text not null,
-  score numeric not null check (score >= 0 and score <= 100),
-  status text check (status in ('lagging', 'balanced', 'strong')),
-  priority int,
-  reason text,
-  created_at timestamptz default now()
-);
+-- Auto-create profile row when someone signs up
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer set search_path = public
+as $$
+begin
+  insert into public.profiles (id, name)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'name', split_part(new.email, '@', 1))
+  )
+  on conflict (id) do nothing;
 
--- Inspiration images
-create table if not exists public.inspo_images (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  storage_path text,
-  url text,
-  notes text,
-  created_at timestamptz default now()
-);
+  insert into public.user_blueprints (user_id, data)
+  values (new.id, '{}'::jsonb)
+  on conflict (user_id) do nothing;
 
--- Workout sessions
-create table if not exists public.workout_sessions (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  session_date date not null,
-  title text not null,
-  focus_parts text[] default '{}',
-  focus_reason text,
-  estimated_minutes int,
-  payload jsonb not null default '{}',
-  completed boolean default false,
-  created_at timestamptz default now()
-);
+  return new;
+end;
+$$;
 
--- Set / progressive overload logs
-create table if not exists public.exercise_logs (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  session_id uuid references public.workout_sessions(id) on delete cascade,
-  exercise_id text not null,
-  exercise_name text not null,
-  set_index int not null,
-  weight_kg numeric,
-  reps int,
-  rpe numeric,
-  logged_at timestamptz default now()
-);
-
--- Nutrition targets by phase
-create table if not exists public.nutrition_targets (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  phase text not null check (phase in ('maintain', 'bulk', 'cut')),
-  calories int not null,
-  protein_g int not null,
-  carbs_g int not null,
-  fat_g int not null,
-  is_active boolean default false,
-  created_at timestamptz default now()
-);
-
--- Measurements
-create table if not exists public.measurements (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles(id) on delete cascade,
-  measured_at date not null,
-  weight_kg numeric,
-  waist_cm numeric,
-  chest_cm numeric,
-  arms_cm numeric,
-  thighs_cm numeric
-);
-
--- Storage bucket for photos (run via dashboard or storage API)
--- insert into storage.buckets (id, name, public) values ('physique', 'physique', false);
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
 
 -- RLS
 alter table public.profiles enable row level security;
-alter table public.physique_photos enable row level security;
-alter table public.body_part_scores enable row level security;
-alter table public.inspo_images enable row level security;
-alter table public.workout_sessions enable row level security;
-alter table public.exercise_logs enable row level security;
-alter table public.nutrition_targets enable row level security;
-alter table public.measurements enable row level security;
+alter table public.user_blueprints enable row level security;
 
-create policy "Users own profile" on public.profiles
-  for all using (auth.uid() = id) with check (auth.uid() = id);
+drop policy if exists "profiles_select_own" on public.profiles;
+drop policy if exists "profiles_update_own" on public.profiles;
+drop policy if exists "profiles_insert_own" on public.profiles;
+drop policy if exists "blueprints_select_own" on public.user_blueprints;
+drop policy if exists "blueprints_insert_own" on public.user_blueprints;
+drop policy if exists "blueprints_update_own" on public.user_blueprints;
+drop policy if exists "blueprints_delete_own" on public.user_blueprints;
 
-create policy "Users own photos" on public.physique_photos
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "profiles_select_own" on public.profiles
+  for select using (auth.uid() = id);
+create policy "profiles_update_own" on public.profiles
+  for update using (auth.uid() = id);
+create policy "profiles_insert_own" on public.profiles
+  for insert with check (auth.uid() = id);
 
-create policy "Users own scores" on public.body_part_scores
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-
-create policy "Users own inspo" on public.inspo_images
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-
-create policy "Users own sessions" on public.workout_sessions
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-
-create policy "Users own logs" on public.exercise_logs
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-
-create policy "Users own nutrition" on public.nutrition_targets
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-
-create policy "Users own measurements" on public.measurements
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "blueprints_select_own" on public.user_blueprints
+  for select using (auth.uid() = user_id);
+create policy "blueprints_insert_own" on public.user_blueprints
+  for insert with check (auth.uid() = user_id);
+create policy "blueprints_update_own" on public.user_blueprints
+  for update using (auth.uid() = user_id);
+create policy "blueprints_delete_own" on public.user_blueprints
+  for delete using (auth.uid() = user_id);

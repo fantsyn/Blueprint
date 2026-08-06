@@ -45,8 +45,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   const handleLogout = () => {
     setMenuOpen(false);
-    logout();
-    router.replace("/login");
+    void Promise.resolve(logout()).then(() => {
+      router.replace("/login");
+    });
   };
 
   return (

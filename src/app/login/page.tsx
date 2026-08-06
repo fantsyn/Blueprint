@@ -16,6 +16,7 @@ export default function LoginPage() {
   const authHydrated = useAuthHydration();
   const login = useAuthStore((s) => s.login);
   const session = useAuthStore((s) => s.session);
+  const cloudEnabled = useAuthStore((s) => s.cloudEnabled);
   const profile = useAppStore((s) => s.profile);
 
   const [email, setEmail] = useState("");
@@ -49,7 +50,11 @@ export default function LoginPage() {
   return (
     <AuthShell
       title="Welcome back"
-      subtitle="Sign in to your blueprint. Remember me keeps you signed in on this device."
+      subtitle={
+        cloudEnabled
+          ? "Sign in with your cloud account — works on any device."
+          : "Sign in to your blueprint. Add Supabase keys for cross-device login."
+      }
       footer={
         <div className="text-center space-y-2.5">
           <p className="text-[13px] text-tertiary">
@@ -62,8 +67,10 @@ export default function LoginPage() {
             </Link>
           </p>
           <p className="text-[11px] text-muted">
+            {cloudEnabled ? "Synced with Supabase" : "Local device only"}
+            {" · "}
             <Link href="/" className="link-quiet">
-              Back to home
+              Home
             </Link>
           </p>
         </div>
@@ -89,12 +96,14 @@ export default function LoginPage() {
           required
         />
 
-        <Checkbox
-          checked={remember}
-          onChange={setRemember}
-          label="Remember me"
-          hint="Stay signed in on this browser until you log out"
-        />
+        {!cloudEnabled && (
+          <Checkbox
+            checked={remember}
+            onChange={setRemember}
+            label="Remember me"
+            hint="Stay signed in on this browser"
+          />
+        )}
 
         {error && (
           <p className="text-[13px] text-danger bg-[rgba(196,122,106,0.08)] border border-[rgba(196,122,106,0.2)] rounded-[var(--radius-md)] px-3 py-2.5">
